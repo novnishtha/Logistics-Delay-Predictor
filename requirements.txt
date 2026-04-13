@@ -1,0 +1,15 @@
+pandas
+numpy
+scikit-learn
+joblib
+
+streamlit
+fastapi
+uvicorn
+
+kafka-python
+pyspark
+
+requests
+
+matplotlib
