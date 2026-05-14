@@ -104,18 +104,42 @@ state_df = state_df.select(
 # 9. Write to PostgreSQL (staging -> final tables with no duplicates)
 
 def upsert_to_postgres():
+
     conn = psycopg2.connect(
         host="localhost",
         database="logistics_db",
         user="admin",
         password="admin"
     )
+
     cur = conn.cursor()
 
     # UPSERT truck_eta
-    cur.execute("""INSERT INTO truck_eta AS t
-        SELECT * FROM truck_eta_staging
+
+    cur.execute("""
+        INSERT INTO truck_eta AS t (
+            vehicle_id,
+            last_update,
+            current_speed,
+            remaining_distance_km,
+            predicted_delay,
+            eta_minutes
+        )
+
+        SELECT DISTINCT ON (vehicle_id)
+            vehicle_id,
+            last_update,
+            current_speed,
+            remaining_distance_km,
+            predicted_delay,
+            eta_minutes
+
+        FROM truck_eta_staging
+
+        ORDER BY vehicle_id, last_update DESC
+
         ON CONFLICT (vehicle_id)
+
         DO UPDATE SET
             last_update = EXCLUDED.last_update,
             current_speed = EXCLUDED.current_speed,
@@ -124,18 +148,34 @@ def upsert_to_postgres():
             eta_minutes = EXCLUDED.eta_minutes;
     """)
 
+    # clear ETA staging table
     cur.execute("TRUNCATE truck_eta_staging;")
 
-    # UPSERT truck_status
+    # upsert truck_status
     cur.execute("""
-        INSERT INTO truck_status AS s
-        SELECT * FROM truck_status_staging
+        INSERT INTO truck_status AS s (
+            vehicle_id,
+            last_update,
+            status
+        )
+
+        SELECT DISTINCT ON (vehicle_id)
+            vehicle_id,
+            last_update,
+            status
+
+        FROM truck_status_staging
+
+        ORDER BY vehicle_id, last_update DESC
+
         ON CONFLICT (vehicle_id)
+
         DO UPDATE SET
             last_update = EXCLUDED.last_update,
             status = EXCLUDED.status;
     """)
 
+    # clear status staging table
     cur.execute("TRUNCATE truck_status_staging;")
 
     conn.commit()
@@ -143,15 +183,24 @@ def upsert_to_postgres():
     conn.close()
 
 def write_to_postgres(batch_df, batch_id):
+
     try:
+
         if batch_df.count() == 0:
             return
 
         print(f"Writing batch {batch_id}...")
 
-        batch_df = batch_df.coalesce(1)
+        # SPARK-SIDE DEDUPLICATION
+        batch_df = batch_df.groupBy("vehicle_id").agg(
+            max("last_update").alias("last_update"),
+            first("current_speed").alias("current_speed"),
+            first("remaining_distance_km").alias("remaining_distance_km"),
+            first("predicted_delay").alias("predicted_delay"),
+            first("eta_minutes").alias("eta_minutes")
+        )
 
-        # 1. Write to ETA staging
+        # WRITE ETA STAGING
         batch_df.write \
             .format("jdbc") \
             .option("url", "jdbc:postgresql://localhost:5432/logistics_db") \
@@ -162,16 +211,27 @@ def write_to_postgres(batch_df, batch_id):
             .mode("append") \
             .save()
 
-        # 2. Create status batch
+
+        # CREATE STATUS BATCH
         status_batch = batch_df.select(
             col("vehicle_id"),
             col("last_update"),
-            when(col("remaining_distance_km") <= 2, "COMPLETED")
+
+            when(col("remaining_distance_km") <= 2,
+                 "COMPLETED")
             .otherwise("IN_PROGRESS")
             .alias("status")
-        ).coalesce(1)
+        )
 
-        # 3. Write to STATUS staging
+        # STATUS DEDUPLICATION
+
+        status_batch = status_batch.groupBy("vehicle_id").agg(
+            max("last_update").alias("last_update"),
+            first("status").alias("status")
+        )
+
+        # WRITE STATUS STAGING
+
         status_batch.write \
             .format("jdbc") \
             .option("url", "jdbc:postgresql://localhost:5432/logistics_db") \
@@ -182,20 +242,38 @@ def write_to_postgres(batch_df, batch_id):
             .mode("append") \
             .save()
 
-        # 4. UPSERT into main tables
+        # UPSERT INTO FINAL TABLES
         upsert_to_postgres()
 
         print(f"Batch {batch_id} upserted successfully")
 
+
     except Exception as e:
+
         print("ERROR:", e)
         raise e
 
-query = state_df.writeStream \
+# query = state_df.writeStream \
+#     .outputMode("update") \
+#     .foreachBatch(write_to_postgres) \
+#     .option("checkpointLocation", "./checkpoints/spark_checkpoint") \
+#     .start()
+
+postgres_query = state_df.writeStream\
     .outputMode("update") \
     .foreachBatch(write_to_postgres) \
-    .option("checkpointLocation", "./checkpoints/spark_checkpoint") \
+    .option("checkpointLocation", "./checkpoints/postgres_checkpoint") \
+    .start()
+
+console_query = state_df.writeStream \
+    .outputMode("update") \
+    .format("console") \
+    .option("truncate", False) \
+    .option("numRows", 20) \
+    .option("checkpointLocation", "./checkpoints/console_checkpoint") \
     .start()
 
 
-query.awaitTermination(160)
+postgres_query.awaitTermination(160)
+console_query.awaitTermination(160)
+
